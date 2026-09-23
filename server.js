@@ -5,33 +5,25 @@ import mysql from 'mysql2'
 import cors from 'cors'
 import multer from 'multer'
 import path from 'path'
-import fs from 'fs'
+import { v2 as cloudinary } from 'cloudinary'
 
 const app = express()
+
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
+})
 
 app.use(cors())
 app.use(express.json())
 
-// Create uploads folder if it doesn't exist
-const uploadDir = path.resolve('uploads')
 
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir)
-}
+app.use('/uploads', express.static(path.resolve('uploads')))
 
 // Multer configuration
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, uploadDir)
-    },
-
-    filename: (req, file, cb) => {
-        cb(null, path.basename(file.originalname))
-    }
-})
-
 const upload = multer({
-    storage: storage,
+    storage: multer.memoryStorage(),
 
     fileFilter: (req, file, cb) => {
         const allowedTypes = [
@@ -48,25 +40,25 @@ const upload = multer({
     }
 })
 
-// Make uploaded images accessible
-app.use('/uploads', express.static(path.resolve(uploadDir)))
+const uploadToCloudinary = buffer => {
+    return new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+            {
+                folder: 'toddler-app'
+            },
+            (error, result) => {
+                if (error) {
+                    reject(error)
+                } else {
+                    resolve(result)
+                }
+            }
+        )
 
-const removeStoredImage = imagePath => {
-    if (!imagePath || !imagePath.startsWith('/uploads/')) {
-        return
-    }
-
-    const filename = path.basename(imagePath)
-    const filePath = path.join(uploadDir, filename)
-
-    try {
-        fs.unlinkSync(filePath)
-    } catch (err) {
-        if (err.code !== 'ENOENT') {
-            console.error('Failed to remove image:', err)
-        }
-    }
+        stream.end(buffer)
+    })
 }
+
 
 // MySQL connection
 const db = mysql.createConnection({
@@ -75,8 +67,7 @@ const db = mysql.createConnection({
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
-    connectTimeout: 20000,
-    family: 4
+    connectTimeout: 20000
 })
 
 db.connect(err => {
@@ -115,8 +106,7 @@ app.get('/data', (req, res) => {
 // INSERT
 // =========================
 
-app.post('/data', upload.single('img'), (req, res) => {
-
+app.post('/data', upload.single('img'), async (req, res) => {
     const {
         name,
         no_t,
@@ -127,10 +117,21 @@ app.post('/data', upload.single('img'), (req, res) => {
         category
     } = req.body
 
-    // Image path
-    const img = req.file
-        ? `/uploads/${req.file.filename}`
-        : ''
+    // Upload image to Cloudinary
+    let img = ''
+
+    if (req.file) {
+        try {
+            const result = await uploadToCloudinary(req.file.buffer)
+            img = result.secure_url
+        } catch (error) {
+            console.error('Cloudinary upload failed:', error)
+
+            return res.status(500).json({
+                message: 'Image upload failed'
+            })
+        }
+    }
 
     const sql = `
         INSERT INTO items
@@ -153,7 +154,6 @@ app.post('/data', upload.single('img'), (req, res) => {
 
         if (err) {
             console.log(err)
-            removeStoredImage(img)
 
             return res.status(500).json({
                 message: 'Insert failed'
@@ -175,7 +175,7 @@ app.post('/data', upload.single('img'), (req, res) => {
 app.put(
     '/data/:name/:category',
     upload.single('img'),
-    (req, res) => {
+    async (req, res) => {
 
         const oldName = req.params.name
         const oldCategory = req.params.category
@@ -198,8 +198,18 @@ app.put(
         // --------------------------------
 
         if (req.file) {
+            let img = ''
 
-            const img = `/uploads/${req.file.filename}`
+            try {
+                const result = await uploadToCloudinary(req.file.buffer)
+                img = result.secure_url
+            } catch (error) {
+                console.error('Cloudinary upload failed:', error)
+
+                return res.status(500).json({
+                    message: 'Image upload failed'
+                })
+            }
 
             sql = `
                 UPDATE items
@@ -262,9 +272,6 @@ app.put(
             ]
         }
 
-        const newImagePath = req.file
-            ? `/uploads/${req.file.filename}`
-            : ''
 
         db.query(
             'SELECT img FROM items WHERE name = ? AND category = ?',
@@ -272,7 +279,6 @@ app.put(
             (selectErr, oldItems) => {
                 if (selectErr) {
                     console.log(selectErr)
-                    removeStoredImage(newImagePath)
 
                     return res.status(500).json({
                         message: 'Update failed'
@@ -283,7 +289,6 @@ app.put(
 
                     if (err) {
                         console.log(err)
-                        removeStoredImage(newImagePath)
 
                         return res.status(500).json({
                             message: 'Update failed'
@@ -291,15 +296,10 @@ app.put(
                     }
 
                     if (result.affectedRows === 0) {
-                        removeStoredImage(newImagePath)
 
                         return res.status(404).json({
                             message: 'Item not found'
                         })
-                    }
-
-                    if (req.file) {
-                        oldItems.forEach(item => removeStoredImage(item.img))
                     }
 
                     res.json({
@@ -355,7 +355,6 @@ app.delete('/data/:name/:category', (req, res) => {
                     })
                 }
 
-                items.forEach(item => removeStoredImage(item.img))
 
                 res.json({
                     message: 'Deleted successfully'
